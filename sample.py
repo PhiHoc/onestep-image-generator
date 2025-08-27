@@ -18,7 +18,6 @@ def tokenize_captions(examples, tokenizer, is_train=False):
         if isinstance(caption, str):
             captions.append(caption)
         elif isinstance(caption, (list, np.ndarray)):
-            # take a random caption if there are multiple
             captions.append(random.choice(caption) if is_train else caption[0])
         else:
             raise ValueError(f"Captions should contain either strings or lists of strings but got {examples}.")
@@ -29,7 +28,6 @@ def tokenize_captions(examples, tokenizer, is_train=False):
         truncation=True,
         return_tensors="pt",
     )
-
     return inputs.input_ids
 
 
@@ -43,21 +41,27 @@ def main(
     output_dir: Path = typer.Option("generated", help="Path to the base outdir", dir_okay=True),
     model_name: str = typer.Option("stabilityai/sd-turbo", help="huggingface model name"),
     seed: int = typer.Option(0, help="seed"),
-    nsamples: int = typer.Option(1, help="seed"),
+    nsamples: int = typer.Option(1, help="number of samples"),
     output_vae: bool = typer.Option(True, help="output PCA-ed VAE output"),
     subfolder: str = typer.Option("unet_ema"),
 ):
+    # --- chọn device ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
     set_seed(seed)
     weight_dtype = torch.float32
+
+    # Load models
     noise_scheduler = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
-    vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae").to("cuda", dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(dir, subfolder=subfolder).to("cuda", dtype=weight_dtype)
+    vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae").to(device, dtype=weight_dtype)
+    unet = UNet2DConditionModel.from_pretrained(dir, subfolder=subfolder).to(device, dtype=weight_dtype)
     unet.eval()
 
-    timestep = torch.ones((1,), dtype=torch.int64, device="cuda")
+    timestep = torch.ones((1,), dtype=torch.int64, device=device)
     timestep = timestep * (noise_scheduler.config.num_train_timesteps - 1)
 
-    alphas_cumprod = noise_scheduler.alphas_cumprod.to("cuda")
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
     alpha_t = (alphas_cumprod[timestep] ** 0.5).view(-1, 1, 1, 1)
     sigma_t = ((1 - alphas_cumprod[timestep]) ** 0.5).view(-1, 1, 1, 1)
     del alphas_cumprod
@@ -67,8 +71,8 @@ def main(
     print(f"Outdir={p}")
 
     def predict_img(prompt):
-        noise = torch.randn(1, 4, 64, 64, device="cuda")
-        input_id = tokenize_captions([prompt], tokenizer).to("cuda")
+        noise = torch.randn(1, 4, 64, 64, device=device)
+        input_id = tokenize_captions([prompt], tokenizer).to(device)
         encoder_hidden_state = text_encoder(input_id)[0].to(dtype=weight_dtype)
 
         model_pred = unet(noise, timestep, encoder_hidden_state).sample
@@ -88,26 +92,27 @@ def main(
         return image, pred_original_sample * vae.config.scaling_factor
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to("cuda")
+    text_encoder = CLIPTextModel.from_pretrained(model_name, subfolder="text_encoder").to(device)
+
+    # Load prompts
     if Path(prompt).exists():
         with open(prompt) as f:
-            prompts = f.readlines()
-            prompts = [p.strip() for p in prompts]
+            prompts = [p.strip() for p in f.readlines()]
     else:
         prompts = [prompt]
-    for prompt in prompts:
-        op = p / f'{prompt.replace(" ", "_")}.png'
-        vop = p / f'{prompt.replace(" ", "_")}_vae.png'
-        op.parent.mkdir(exist_ok=True, parents=True)
 
+    # Generate
+    for prompt in prompts:
         for i in range(nsamples):
             op = p / f'{i}_{prompt.replace(" ", "_")}.png'
+            vop = p / f'{i}_{prompt.replace(" ", "_")}_vae.png'
+            op.parent.mkdir(exist_ok=True, parents=True)
+
             image, vae_latent = predict_img(prompt)
             save_image(image, op.as_posix())
 
             if output_vae:
                 latent_reshaped = vae_latent[0].detach().cpu().numpy().reshape(4, -1).T
-                vop = p / f'{i}_{prompt.replace(" ", "_")}_vae.png'
                 pca = PCA(n_components=3)
                 latent_pca = pca.fit_transform(latent_reshaped)
                 latent_pca_reshaped = latent_pca.T.reshape(3, 64, 64)
@@ -117,8 +122,8 @@ def main(
                     * 255
                 ).astype(np.uint8)
                 latent_image = np.transpose(latent_normalized, (1, 2, 0))
-                vae_latent = Image.fromarray(latent_image, "RGB")
-                vae_latent.save(vop)
+                vae_latent_img = Image.fromarray(latent_image, "RGB")
+                vae_latent_img.save(vop)
 
 
 if __name__ == "__main__":
